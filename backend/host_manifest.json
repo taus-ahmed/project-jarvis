@@ -1,0 +1,9 @@
+{
+  "name": "com.jarvis.bridge",
+  "description": "Jarvis Host",
+  "path": "host.bat",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://dnapoleepflekcgglbolkfijbmmjbpme/"
+  ]
+}
