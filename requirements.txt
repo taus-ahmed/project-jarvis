@@ -1,0 +1,15 @@
+# JARVIS - Local Desktop AI Orchestrator
+# Core dependencies for running the application
+
+# UI Framework
+streamlit>=1.30.0
+
+# LLM Integration
+ollama>=0.1.0
+
+# Vector Database for Memory
+chromadb>=0.4.0
+
+# Windows-specific APIs (for active window and clipboard)
+pywin32>=306
+psutil>=5.9.0

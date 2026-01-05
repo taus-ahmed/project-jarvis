@@ -1,0 +1,3 @@
+Jarvis is a sandboxed AI agent.
+It restricts filesystem access.
+All actions are audited for safety.
