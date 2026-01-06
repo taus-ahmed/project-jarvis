@@ -1,0 +1,31 @@
+# Voice Module Dependencies for Jarvis Desktop LAM
+# Python 3.9+ required
+
+# Core async/audio
+pyaudio>=0.2.13
+numpy>=1.24.0
+asyncio>=3.4.3
+
+# HTTP client for LLM API calls
+aiohttp>=3.9.0
+
+# Wake Word Detection (CPU)
+openwakeword>=0.5.1
+onnxruntime>=1.16.0  # For openWakeWord inference
+
+# Speech-to-Text (GPU accelerated)
+faster-whisper>=0.10.0
+torch>=2.0.0  # For Silero VAD and CUDA detection
+torchaudio>=2.0.0
+
+# Voice Activity Detection
+# Silero VAD loaded via torch.hub (no separate install needed)
+
+# Text-to-Speech
+# Piper TTS - install binary separately from: https://github.com/rhasspy/piper
+# Optional fallback:
+pyttsx3>=2.90  # Fallback TTS if Piper not available
+
+# Optional utilities
+soundfile>=0.12.1  # Audio file I/O
+scipy>=1.10.0  # Audio processing utilities
