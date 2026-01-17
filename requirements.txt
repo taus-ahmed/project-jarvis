@@ -1,0 +1,17 @@
+# Core
+requests>=2.31.0
+
+# Voice input (Whisper)
+openai-whisper
+torch
+sounddevice
+numpy
+
+# Audio handling (required by Whisper on Windows)
+ffmpeg-python
+
+# Optional but recommended (faster math)
+scipy
+
+# Optional (future: Jarvis talking back)
+pyttsx3
