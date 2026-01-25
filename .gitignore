@@ -10,6 +10,8 @@ yarn-error.log*
 
 # Sensitive authentication data
 auth_state.json
+groq.config.json
+config.json
 
 # Generated directories
 downloads/

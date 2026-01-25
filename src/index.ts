@@ -12,19 +12,35 @@ import {
   ListToolsRequestSchema,
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
-import { chromium, Browser, BrowserContext, Page } from "playwright";
+import { chromium, BrowserContext, Page } from "playwright";
 import { promises as fs } from "fs";
 import path from "path";
+import os from "os";
 
 // Configuration
 const AUTH_STATE_FILE = path.join(process.cwd(), "auth_state.json");
 const DOWNLOADS_DIR = path.join(process.cwd(), "downloads");
 const SCREENSHOTS_DIR = path.join(process.cwd(), "screenshots");
+const PROFILE_CONFIG_FILE = path.join(process.cwd(), "profile-config.json");
 
-// Global browser state
-let browser: Browser | null = null;
-let context: BrowserContext | null = null;
-let page: Page | null = null;
+// Chrome profile paths by OS
+const CHROME_USER_DATA_PATHS: Record<string, string> = {
+  win32: path.join(os.homedir(), "AppData", "Local", "Google", "Chrome", "User Data"),
+  darwin: path.join(os.homedir(), "Library", "Application Support", "Google", "Chrome"),
+  linux: path.join(os.homedir(), ".config", "google-chrome")
+};
+
+// Global browser state - using persistent context
+let browserContext: BrowserContext | null = null;
+let currentPage: Page | null = null;
+
+// Chrome profile interface
+interface ChromeProfile {
+  name: string;
+  email?: string;
+  directory: string;
+  userDataDir: string;
+}
 
 // Ensure required directories exist
 async function ensureDirectories() {
@@ -33,47 +49,120 @@ async function ensureDirectories() {
 }
 
 /**
- * Initialize browser with persistent authentication
+ * Detect Chrome profiles on the system
  */
-async function initializeBrowser(): Promise<void> {
-  if (browser) {
-    return; // Already initialized
+async function detectChromeProfiles(): Promise<ChromeProfile[]> {
+  const profiles: ChromeProfile[] = [];
+  const platform = os.platform();
+  const userDataDir = CHROME_USER_DATA_PATHS[platform];
+
+  if (!userDataDir) {
+    return profiles;
   }
 
-  browser = await chromium.launch({
-    headless: false, // Set to false to see browser UI; true for headless
-    args: ['--disable-blink-features=AutomationControlled']
-  });
+  try {
+    // Check if Chrome user data directory exists
+    await fs.access(userDataDir);
 
-  // Check if we have saved authentication state
+    // Read all directories in User Data
+    const entries = await fs.readdir(userDataDir, { withFileTypes: true });
+
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+
+      // Chrome profiles are named "Default", "Profile 1", "Profile 2", etc.
+      if (entry.name === "Default" || entry.name.startsWith("Profile ")) {
+        const profileDir = path.join(userDataDir, entry.name);
+        const prefsPath = path.join(profileDir, "Preferences");
+
+        try {
+          // Read preferences file to get profile name and email
+          const prefsData = await fs.readFile(prefsPath, "utf-8");
+          const prefs = JSON.parse(prefsData);
+
+          const profileName = prefs?.profile?.name || entry.name;
+          const email = prefs?.account_info?.[0]?.email || 
+                       prefs?.signin?.allowed_username || undefined;
+
+          profiles.push({
+            name: profileName,
+            email: email,
+            directory: entry.name,
+            userDataDir: userDataDir
+          });
+        } catch (error) {
+          // If can't read preferences, add basic info
+          profiles.push({
+            name: entry.name,
+            directory: entry.name,
+            userDataDir: userDataDir
+          });
+        }
+      }
+    }
+  } catch (error) {
+    // Chrome not installed or path doesn't exist
+    console.error("Could not detect Chrome profiles:", error);
+  }
+
+  return profiles;
+}
+
+/**
+ * Save profile preference
+ */
+async function saveProfilePreference(profile: ChromeProfile): Promise<void> {
+  await fs.writeFile(PROFILE_CONFIG_FILE, JSON.stringify(profile, null, 2));
+}
+
+/**
+ * Select and launch Chrome with a persistent user profile
+ * Uses regular browser launch with storage state for better cookie handling
+ */
+async function selectChromeProfile(userDataDir: string): Promise<{ success: boolean; directory: string }> {
+  // Close previous context if any
+  if (browserContext) {
+    await browserContext.close();
+    browserContext = null;
+    currentPage = null;
+  }
+
+  // Try to load saved auth state
   let storageState = undefined;
   try {
     const authData = await fs.readFile(AUTH_STATE_FILE, "utf-8");
     storageState = JSON.parse(authData);
-    // console.error("Loaded authentication state from auth_state.json");
+    console.error(`✓ Loaded auth state: ${storageState.cookies?.length || 0} cookies`);
   } catch (error) {
-    // console.error("No existing auth state found, starting fresh session");
+    console.error(`⚠️  No auth state found. Run setup-auth.js to save your Gmail login.`);
   }
 
-  context = await browser.newContext({
-    storageState,
+  // Use launchPersistentContext with the actual Chrome profile directory
+  // This preserves bookmarks, extensions, and settings
+  browserContext = await chromium.launchPersistentContext(userDataDir, {
+    headless: false,
+    channel: 'chrome',
     viewport: { width: 1920, height: 1080 },
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     acceptDownloads: true,
+    args: [
+      '--disable-blink-features=AutomationControlled',
+    ],
   });
 
-  page = await context.newPage();
+  currentPage = browserContext.pages()[0] ?? (await browserContext.newPage());
+
+  return { success: true, directory: userDataDir };
 }
 
 /**
  * Save current authentication state
  */
 async function saveAuthState(): Promise<void> {
-  if (!context) {
+  if (!browserContext) {
     throw new Error("Browser context not initialized");
   }
 
-  const state = await context.storageState();
+  const state = await browserContext.storageState();
   await fs.writeFile(AUTH_STATE_FILE, JSON.stringify(state, null, 2));
   // console.error("Authentication state saved to auth_state.json");
 }
@@ -82,9 +171,10 @@ async function saveAuthState(): Promise<void> {
  * Get accessibility tree snapshot for LLM reasoning
  */
 async function getAccessibilitySnapshot(): Promise<string> {
-  if (!page) {
+  if (!currentPage) {
     throw new Error("Browser page not initialized");
   }
+  const page = currentPage;
 
   // Get accessible name and role for all elements
   // Using string form since evaluate() will execute this in browser context
@@ -114,9 +204,10 @@ async function getAccessibilitySnapshot(): Promise<string> {
  * Extract simplified accessibility tree for better LLM parsing
  */
 async function getSimplifiedSnapshot(): Promise<any> {
-  if (!page) {
+  if (!currentPage) {
     throw new Error("Browser page not initialized");
   }
+  const page = currentPage;
 
   // Get page title and URL
   const url = page.url();
@@ -213,9 +304,10 @@ async function getSimplifiedSnapshot(): Promise<any> {
  * Smart selector resolution with fallback logic
  */
 async function resolveSelector(selector: string): Promise<string> {
-  if (!page) {
+  if (!currentPage) {
     throw new Error("Browser page not initialized");
   }
+  const page = currentPage;
 
   // Try the selector as-is first
   try {
@@ -361,6 +453,25 @@ const tools: Tool[] = [
       },
       required: ["selector"]
     }
+  },
+  {
+    name: "browser_list_profiles",
+    description: "List all available Chrome profiles on the system with their names and email addresses. Use this to let the user select which profile to use.",
+    inputSchema: {
+      type: "object",
+      properties: {}
+    }
+  },
+  {
+    name: "browser_select_profile",
+    description: "Select a Chrome profile to use for automation. This launches Chrome with the user's logged-in profile, giving access to their accounts. Browser will be reinitialized with this profile.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        directory: { type: "string", description: "Profile directory name (e.g., 'Default', 'Profile 1')" }
+      },
+      required: ["directory"]
+    }
   }
 ];
 
@@ -387,22 +498,39 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
   try {
-    // Initialize browser if not already done
-    await initializeBrowser();
+    // Check if browser context is active (skip for profile management tools)
+    const profileManagementTools = ["browser_list_profiles", "browser_select_profile"];
+    if (!profileManagementTools.includes(name)) {
+      if (!browserContext || !currentPage) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                success: false,
+                error: "No browser profile/context is active. Call browser_select_profile first."
+              })
+            }
+          ],
+          isError: true
+        };
+      }
+    }
 
     switch (name) {
       case "browser_navigate": {
+        const page = currentPage!;
         const url = getArg<string>(args, "url", "");
         const waitUntil = getArg<string>(args, "waitUntil", "load");
-        await page!.goto(url, { waitUntil: waitUntil as any });
+        await page.goto(url, { waitUntil: waitUntil as any });
         return {
           content: [
             {
               type: "text",
               text: JSON.stringify({
                 success: true,
-                url: page!.url(),
-                title: await page!.title()
+                url: page.url(),
+                title: await page.title()
               })
             }
           ]
@@ -410,13 +538,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "browser_click": {
+        const page = currentPage!;
         const selector = getArg<string>(args, "selector", "");
         const timeout = getArg<number>(args, "timeout", 30000);
         const resolvedSelector = await resolveSelector(selector);
-        await page!.locator(resolvedSelector).first().click({ timeout });
+        await page.locator(resolvedSelector).first().click({ timeout });
         
         // Wait a bit for any navigation or dynamic content
-        await page!.waitForTimeout(1000);
+        await page.waitForTimeout(1000);
         
         return {
           content: [
@@ -426,7 +555,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 success: true,
                 clicked: selector,
                 resolvedSelector,
-                currentUrl: page!.url()
+                currentUrl: page.url()
               })
             }
           ]
@@ -434,11 +563,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "browser_fill_form": {
+        const page = currentPage!;
         const selector = getArg<string>(args, "selector", "");
         const value = getArg<string>(args, "value", "");
         const timeout = getArg<number>(args, "timeout", 30000);
         const resolvedSelector = await resolveSelector(selector);
-        await page!.locator(resolvedSelector).first().fill(value, { timeout });
+        await page.locator(resolvedSelector).first().fill(value, { timeout });
         
         return {
           content: [
@@ -475,6 +605,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "browser_screenshot": {
+        const page = currentPage!;
         const filename = getArg<string>(args, "filename");
         const fullPage = getArg<boolean>(args, "fullPage", false);
         
@@ -482,7 +613,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const screenshotName = filename || `screenshot-${timestamp}.png`;
         const screenshotPath = path.join(SCREENSHOTS_DIR, screenshotName);
 
-        await page!.screenshot({
+        await page.screenshot({
           path: screenshotPath,
           fullPage: fullPage || false
         });
@@ -519,8 +650,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "browser_evaluate": {
+        const page = currentPage!;
         const script = getArg<string>(args, "script", "");
-        const result = await page!.evaluate(script as any);
+        const result = await page.evaluate(script as any);
         
         return {
           content: [
@@ -536,10 +668,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "browser_wait_for": {
+        const page = currentPage!;
         const selector = getArg<string>(args, "selector", "");
         const timeout = getArg<number>(args, "timeout", 30000);
         const state = getArg<string>(args, "state", "visible");
-        await page!.locator(selector).first().waitFor({ 
+        await page.locator(selector).first().waitFor({ 
           timeout, 
           state: state as any 
         });
@@ -557,6 +690,105 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             }
           ]
         };
+      }
+
+      case "browser_list_profiles": {
+        const profiles = await detectChromeProfiles();
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                success: true,
+                profiles: profiles.map(p => ({
+                  name: p.name,
+                  email: p.email,
+                  directory: p.directory
+                }))
+              })
+            }
+          ]
+        };
+      }
+
+      case "browser_select_profile": {
+        const directory = getArg<string>(args, "directory", "");
+        
+        if (!directory) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  success: false,
+                  error: "Profile directory is required"
+                })
+              }
+            ],
+            isError: true
+          };
+        }
+        
+        // Find the profile
+        const profiles = await detectChromeProfiles();
+        const profile = profiles.find(p => p.directory === directory);
+        
+        if (!profile) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  success: false,
+                  error: `Profile not found: ${directory}. Available profiles: ${profiles.map(p => p.directory).join(", ")}`
+                })
+              }
+            ],
+            isError: true
+          };
+        }
+        
+        // Build full profile path
+        const fullProfilePath = path.join(profile.userDataDir, profile.directory);
+        
+        try {
+          // Select the Chrome profile and create persistent context
+          await selectChromeProfile(fullProfilePath);
+          
+          // Save preference for future use
+          await saveProfilePreference(profile);
+          
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  success: true,
+                  directory: fullProfilePath,
+                  message: `Profile selected and persistent context created: ${profile.name}${profile.email ? ` (${profile.email})` : ""}`,
+                  profile: {
+                    name: profile.name,
+                    email: profile.email,
+                    directory: profile.directory
+                  }
+                })
+              }
+            ]
+          };
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  success: false,
+                  error: `Failed to select profile: ${error instanceof Error ? error.message : String(error)}`
+                })
+              }
+            ],
+            isError: true
+          };
+        }
       }
 
       default:
@@ -589,17 +821,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function cleanup() {
   // console.error("Shutting down browser automation server...");
   
-  if (context) {
+  if (browserContext) {
     try {
       // Auto-save auth state on shutdown
       await saveAuthState();
     } catch (error) {
       // Silent failure
     }
-  }
-  
-  if (browser) {
-    await browser.close();
+    
+    await browserContext.close();
   }
   
   process.exit(0);

@@ -27,7 +27,8 @@ Get your free Groq API key at [console.groq.com/keys](https://console.groq.com/k
 
 ## 🛠️ Features
 
-- **8 Browser Automation Tools** via MCP protocol
+- **10 Browser Automation Tools** via MCP protocol
+- **Chrome Profile Management** - Use your real Chrome profile with logged-in sessions
 - **Natural Language Control** - Describe actions in plain English
 - **Dual LLM Support** - Groq Cloud API (70B models) or Local Ollama
 - **Persistent Authentication** - Saves browser cookies/storage (`auth_state.json`)
@@ -93,6 +94,8 @@ node llm-client.js --ollama --interactive llama3.2:3b
 6. **browser_wait_for** - Wait for elements/timeouts
 7. **browser_evaluate** - Execute JavaScript
 8. **browser_save_auth** - Save authentication state
+9. **browser_list_profiles** - List available Chrome profiles
+10. **browser_select_profile** - Switch to a specific Chrome profile
 
 ## 📖 Command Examples
 
@@ -113,14 +116,61 @@ node llm-client.js --ollama --interactive llama3.2:3b
 "Get the page title using JavaScript"
 ```
 
+## 👤 Chrome Profile Management
+
+**NEW!** Use your real Chrome profile with all your logged-in sessions (Gmail, Amazon, etc.)
+
+When you start the interactive client, it will:
+1. Detect all your Chrome profiles automatically
+2. Show you a list with names and email addresses
+3. Let you select which profile to use
+4. Launch Chrome with your selected profile
+
+**Example:**
+```bash
+node llm-client.js --groq --interactive
+
+# Output:
+# 🔍 Checking for Chrome profiles...
+# 
+# 📂 Found 5 Chrome profile(s):
+# 
+#   1. Tauseef (taus08ahmed@gmail.com)
+#   2. Person 1 (taususethis@gmail.com)
+#   3. Your Chrome
+#   4. Person 1 (tauseef28ahmed@gmail.com)
+#   5. asu.edu (mnola354@asu.edu)
+# 
+# 👤 Select profile (1-5, or press Enter to skip): 1
+# 
+# ✅ Browser initialized with profile: Tauseef (taus08ahmed@gmail.com)
+# 🌐 Chrome is now open with your profile!
+```
+
+**Benefits:**
+- Access Gmail, Google Sheets, Amazon with existing logins
+- No need to manually log in each time
+- Test real-world workflows with your actual accounts
+- Skip profile selection to use default test browser
+
+**Manual Profile Commands:**
+```bash
+# List profiles
+{"tool":"browser_list_profiles","arguments":{}}
+
+# Select specific profile
+{"tool":"browser_select_profile","arguments":{"directory":"Default"}}
+```
+
 ## 🏗️ Project Structure
 
 ```
 project-jarvis/
 ├── src/
-│   └── index.ts          # MCP server (8 browser tools)
-├── llm-client.js         # Interactive LLM client
+│   └── index.ts          # MCP server (10 browser tools + profile management)
+├── llm-client.js         # Interactive LLM client with profile selection
 ├── test-client.js        # Tool validation
+├── test-profiles.js      # Profile management testing
 ├── GROQ_SETUP.md         # Groq integration guide
 └── README.md             # This file
 ```

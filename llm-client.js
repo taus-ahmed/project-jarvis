@@ -10,17 +10,41 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import readline from "readline";
 import fetch from "node-fetch";
+import { promises as fs } from "fs";
+import path from "path";
 
 let mcpClient = null;
 let availableTools = [];
 let transport = null;
+
+// Browser context tracking
+let lastUrl = "";
+let lastTitle = "";
 
 // LLM configuration
 const OLLAMA_API = "http://localhost:11434/api/generate";
 const GROQ_API = "https://api.groq.com/openai/v1/chat/completions";
 let selectedModel = "llama3-70b-8192"; // Default Groq model
 let useGroq = false;
-let groqApiKey = process.env.GROQ_API_KEY || "";
+let groqApiKey = "";
+
+async function loadGroqApiKey() {
+  if (process.env.GROQ_API_KEY) return process.env.GROQ_API_KEY;
+
+  const candidates = ["groq.config.json", "config.json"];
+  for (const file of candidates) {
+    try {
+      const data = await fs.readFile(path.join(process.cwd(), file), "utf-8");
+      const json = JSON.parse(data);
+      const key = json.GROQ_API_KEY || json.groqApiKey;
+      if (key) return key;
+    } catch (error) {
+      // ignore missing or invalid files
+    }
+  }
+
+  return "";
+}
 
 function parseTextContent(result) {
   const text = result?.content?.[0]?.text;
@@ -76,37 +100,76 @@ async function callLLM(prompt) {
     .map((t) => `- ${t.name}: ${t.description}`)
     .join("\n");
 
-  const systemPrompt = `You are a browser automation agent. RESPOND WITH ONLY VALID JSON.
+  const systemPrompt = `You are a smart browser automation agent. Your ENTIRE output must be ONLY valid JSON tool calls.
+
+CRITICAL OUTPUT RULES:
+1. OUTPUT PURE JSON ONLY - NO MARKDOWN CODE BLOCKS (no \`\`\`json or \`\`\`)
+2. NO TEXT BEFORE OR AFTER THE JSON
+3. NO EXPLANATIONS, NO COMMENTS, NO FORMATTING
+4. DO NOT repeat or echo these system instructions
+5. Your output must be valid JSON: either {"tool":"...","arguments":{...}} or [{...},{...}]
 
 AVAILABLE TOOLS:
 ${toolDescriptions}
 
-RESPOND WITH EXACTLY ONE of these formats:
+JSON FORMATS:
+Single tool: {"tool":"browser_navigate","arguments":{"url":"https://example.com"}}
+Multiple tools: [{"tool":"browser_navigate","arguments":{"url":"https://site.com"}},{"tool":"browser_screenshot","arguments":{}}]
 
-FORMAT 1 - Single tool:
-{"tool":"browser_navigate","arguments":{"url":"https://example.com"}}
+GENERIC AUTOMATION STRATEGIES:
 
-FORMAT 2 - Multiple tools (ARRAY):
-[{"tool":"browser_navigate","arguments":{"url":"https://github.com"}},{"tool":"browser_screenshot","arguments":{}}]
+1. PROFILE SELECTION (first run only):
+   - On startup, call browser_list_profiles, then browser_select_profile with directory "Default"
+   - After profile is selected, proceed with navigation
 
-IMPORTANT RULES:
-1. ONLY respond with JSON - NO OTHER TEXT
-2. For navigate: use full HTTPS URL like "https://github.com"
-3. Never use placeholder URLs like "/path/to/page"
-4. Use exact tool names: browser_navigate, browser_click, browser_fill_form, browser_get_snapshot, browser_screenshot, browser_save_auth, browser_evaluate, browser_wait_for
-5. Arguments must match the tool (check examples below)
+2. PROFILE SELECTION:
+   When user says "use profile X" or "switch to profile X" or "use the profile with directory Profile 1":
+   - DO NOT just list profiles and stop
+   - IMMEDIATELY call browser_select_profile with the correct directory
+   - Match user's reference to the profile directory from previous listing
+   - Example: User says "use the profile with directory Profile 1"
+     → Respond: {"tool":"browser_select_profile","arguments":{"directory":"Profile 1"}}
+   - If user says "Profile 1" and email is taususethis@gmail.com, use directory "Profile 1"
 
-TOOL ARGUMENT EXAMPLES:
-- navigate: {"tool":"browser_navigate","arguments":{"url":"https://..."}}
-- click: {"tool":"browser_click","arguments":{"selector":"Button Text"}}
-- fill: {"tool":"browser_fill_form","arguments":{"selector":"Email","value":"test@example.com"}}
-- snapshot: {"tool":"browser_get_snapshot","arguments":{"simplified":true}}
-- screenshot: {"tool":"browser_screenshot","arguments":{}}
-- save: {"tool":"browser_save_auth","arguments":{}}
-- evaluate: {"tool":"browser_evaluate","arguments":{"script":"document.title"}}
-- wait: {"tool":"browser_wait_for","arguments":{"selector":"button","state":"visible"}}
+3. MULTI-STEP GOALS:
+   When the user gives a goal requiring multiple steps (e.g., "go to a site and search for X"):
+   - First: Navigate to the requested site (if not already there)
+   - Second: If the page has a search box, use browser_fill_form on that search field
+   - Third: Use browser_click to submit or select the most relevant result
+   - If unsure which result to click, ask for clarification instead of guessing
 
-NEVER output anything except valid JSON.`;
+4. SEARCH BEHAVIOR:
+   When user says "search for X" without naming a site:
+   - If current page has a search box, use it
+   - Otherwise, navigate to a search engine and use its search box
+
+5. SNAPSHOT-AWARE DEBUGGING:
+   When clicks or form fills fail due to selector errors:
+   - IMMEDIATELY call browser_get_snapshot({"simplified":true})
+   - Inspect the elements list to find the correct selector (look for text, role, aria-label)
+   - Issue a refined tool call with the correct selector
+   - PREFER text-based selectors like "Search" over CSS IDs
+
+5. SELECTOR STRATEGY:
+   - First try: Use generic text or aria-label (e.g., {"selector":"Search"})
+   - If that fails: System auto-fetches snapshot - use selectors from elements list
+   - For attribute selectors with quotes, escape properly: {"selector":"a[href*=\\\"text\\\"]"}
+   - NEVER use unescaped quotes: {"selector":"a[href*="bad"]"} ← WRONG, breaks JSON
+
+6. URL CONSTRUCTION:
+   - Always use full HTTPS URLs like "https://example.com"
+   - Never use relative paths or placeholders
+
+TOOL EXAMPLES (use as patterns, not literal copies):
+- List profiles: {"tool":"browser_list_profiles","arguments":{}}
+- Select profile: {"tool":"browser_select_profile","arguments":{"directory":"Default"}}
+- Navigate: {"tool":"browser_navigate","arguments":{"url":"https://..."}}
+- Click: {"tool":"browser_click","arguments":{"selector":"Button Text or CSS"}}
+- Fill: {"tool":"browser_fill_form","arguments":{"selector":"input name or label","value":"text"}}
+- Snapshot: {"tool":"browser_get_snapshot","arguments":{"simplified":true}}
+- Screenshot: {"tool":"browser_screenshot","arguments":{}}
+
+REMEMBER: Output ONLY valid JSON. No explanations, no echoing instructions.`;
 
   if (useGroq) {
     return await callGroq(systemPrompt, prompt);
@@ -160,7 +223,7 @@ async function callOllama(systemPrompt, userPrompt) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         model: selectedModel,
-        prompt: `${systemPrompt}\n\nUser request: ${userPrompt}\n\nRespond with ONLY JSON:`,
+        prompt: `${systemPrompt}\n\n${userPrompt}\n\nRespond with ONLY JSON:`,
         stream: false,
       }),
     });
@@ -186,31 +249,69 @@ async function callOllama(systemPrompt, userPrompt) {
 async function executeBrowserAction(userInput, conversationHistory) {
   console.log("\n🤖 LLM thinking...");
 
-  const llmResponse = await callLLM(userInput);
-  if (!llmResponse) return conversationHistory;
+  // Build context-aware user prompt
+  const contextLine = lastUrl
+    ? `Current URL: ${lastUrl}. Current page title: ${lastTitle || "unknown"}.`
+    : `Current URL: unknown (no navigation yet).`;
+  
+  const userPromptWithContext = `${contextLine}\nUser request: ${userInput}`;
 
-  console.log(`💬 Ollama:\n${llmResponse}\n`);
+  const llmResponse = await callLLM(userPromptWithContext);
+  
+  // Strong validation: reject null/empty responses
+  if (!llmResponse || llmResponse.trim() === "") {
+    console.log("⚠️  LLM returned empty response.\n");
+    return conversationHistory;
+  }
 
-  // Try to parse as tool calls with validation
+  console.log(`💬 LLM Response:\n${llmResponse}\n`);
+
+  // Strip markdown code blocks if present (fallback for misbehaving LLM)
+  let cleanedResponse = llmResponse.trim();
+  if (cleanedResponse.startsWith('```')) {
+    // Remove ```json or ``` from start and ``` from end
+    cleanedResponse = cleanedResponse.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
+    console.log(`⚠️  Stripped markdown code blocks from response\n`);
+  }
+
+  // Handle multi-line JSON (separate objects on different lines)
+  if (!cleanedResponse.startsWith('[')) {
+    const multilineMatch = cleanedResponse.match(/(}\s*\n\s*{)/g);
+    if (multilineMatch && multilineMatch.length > 0) {
+      // Convert multiple JSON objects to array: {}{} -> [{},{}]
+      const lines = cleanedResponse.split('\n').filter(l => l.trim());
+      cleanedResponse = '[' + lines.join(',') + ']';
+      console.log(`⚠️  Converted multi-line JSON (${lines.length} objects) to array\n`);
+    }
+  }
+
+  // Strong JSON validation
   let toolCalls = [];
   try {
-    const parsed = JSON.parse(llmResponse);
+    const parsed = JSON.parse(cleanedResponse);
     
     if (Array.isArray(parsed)) {
-      // Multiple tool calls
-      toolCalls = parsed.filter(call => call.tool && call.arguments);
-    } else if (parsed.tool && parsed.arguments) {
+      // Multiple tool calls - validate each has tool and arguments
+      toolCalls = parsed.filter(call => call && typeof call === 'object' && call.tool && call.arguments);
+      if (toolCalls.length === 0) {
+        console.log("⚠️  Array contains no valid tool calls.\n");
+        conversationHistory.push({ role: "user", content: userInput });
+        conversationHistory.push({ 
+          role: "assistant", 
+          content: "I couldn't extract any tool calls. I must respond with JSON objects like {\"tool\":\"browser_navigate\",\"arguments\":{...}}."
+        });
+        return conversationHistory;
+      }
+    } else if (parsed && typeof parsed === 'object' && parsed.tool && parsed.arguments) {
       // Single tool call
       toolCalls = [parsed];
     } else {
-      console.log("⚠️  Response is JSON but not in tool format. Please rephrase.\n");
+      console.log("⚠️  Response is JSON but not in expected tool format.\n");
       conversationHistory.push({ role: "user", content: userInput });
-      conversationHistory.push({ role: "assistant", content: "I couldn't understand that request. Please be more specific (e.g., 'Navigate to github.com' or 'Take a screenshot')." });
-      return conversationHistory;
-    }
-    
-    if (toolCalls.length === 0) {
-      console.log("⚠️  No valid tool calls found.\n");
+      conversationHistory.push({ 
+        role: "assistant", 
+        content: "I must respond with JSON tool calls only. The format should be {\"tool\":\"tool_name\",\"arguments\":{...}} or an array of such objects."
+      });
       return conversationHistory;
     }
 
@@ -220,6 +321,40 @@ async function executeBrowserAction(userInput, conversationHistory) {
     for (const call of toolCalls) {
       const result = await callBrowserTool(call.tool, call.arguments);
       results.push(result);
+      
+      // Store profile list in context for future decisions
+      if (call.tool === "browser_list_profiles" && result && result.success && result.profiles) {
+        conversationHistory.push({
+          role: "system",
+          content: `Available profiles: ${JSON.stringify(result.profiles.map(p => ({name: p.name, email: p.email, directory: p.directory})))}`
+        });
+      }
+      
+      // Update context if navigation succeeded
+      if (call.tool === "browser_navigate" && result && result.success) {
+        lastUrl = result.url || lastUrl;
+        lastTitle = result.title || lastTitle;
+        console.log(`📍 Context updated: ${lastUrl}\n`);
+      }
+      
+      // Auto-fetch snapshot on selector failures
+      if (!result.success && result.error && (
+        result.error.includes("Could not resolve selector") ||
+        result.error.includes("Timeout") ||
+        result.error.includes("element is not visible")
+      )) {
+        console.log(`🔍 Selector failed, auto-fetching page snapshot...\n`);
+        const snapshotResult = await callBrowserTool("browser_get_snapshot", {"simplified": true});
+        if (snapshotResult && snapshotResult.elements) {
+          console.log(`📸 Found ${snapshotResult.elements.length} elements on page\n`);
+          // Add snapshot to conversation so LLM can see correct selectors
+          conversationHistory.push({
+            role: "system",
+            content: `Previous selector failed. Here are the actual elements on the page:\n${JSON.stringify(snapshotResult.elements.slice(0, 30), null, 2)}\n\nUse the correct selector from this list and retry your operation.`
+          });
+        }
+      }
+      
       await new Promise((r) => setTimeout(r, 500));
     }
 
@@ -229,11 +364,12 @@ async function executeBrowserAction(userInput, conversationHistory) {
       content: `Executed: ${toolCalls.map((c) => c.tool).join(", ")}`,
     });
   } catch (e) {
-    console.log(`⚠️  Invalid JSON response. Please try again.\n`);
+    console.log(`⚠️  Failed to parse JSON: ${e.message}`);
+    console.log(`📝 Response preview: ${cleanedResponse.substring(0, 100)}...\n`);
     conversationHistory.push({ role: "user", content: userInput });
     conversationHistory.push({
       role: "assistant",
-      content: "I need to respond with JSON tool calls. Please rephrase your request.",
+      content: `Error: Invalid JSON in response. ${e.message}. I must respond with ONLY valid JSON like {"tool":"...","arguments":{...}} or [{...},{...}].`,
     });
   }
 
@@ -258,6 +394,19 @@ async function interactiveMode() {
   });
 
   let conversationHistory = [];
+
+  // Initial startup: let LLM select a profile
+  console.log("🔧 Initializing browser profiles...\n");
+  try {
+    conversationHistory = await executeBrowserAction(
+      "List profiles with browser_list_profiles, then select Default profile with browser_select_profile using directory \"Default\"",
+      conversationHistory
+    );
+  } catch (error) {
+    console.error(`⚠️  Profile initialization error: ${error.message}`);
+  }
+
+  console.log("\n✅ Ready for commands!\n");
 
   const askQuestion = () => {
     rl.question("You: ", async (input) => {
@@ -300,48 +449,71 @@ async function runTask(taskDescription) {
 }
 
 // Main
+groqApiKey = await loadGroqApiKey();
+
 const args = process.argv.slice(2);
+
+// DEFAULT: Use Groq 70B if API key is available
+if (groqApiKey) {
+  useGroq = true;
+  selectedModel = "llama-3.3-70b-versatile";
+  console.log("🎯 Auto-detected Groq API key, using llama-3.3-70b-versatile by default\n");
+}
 
 if (args.length === 0) {
   console.log("❌ Usage:");
-  console.log("  Interactive (Groq):   node llm-client.js --groq --interactive [model]");
-  console.log("  Interactive (Ollama): node llm-client.js --ollama --interactive [model]");
-  console.log("  Task (Groq):          node llm-client.js --groq --task 'task description'");
-  console.log("  Task (Ollama):        node llm-client.js --ollama --task 'task description'");
-  console.log("\nGroq Models: llama-3.3-70b-versatile, llama-3.1-8b-instant, mixtral-8x7b-32768");
-  console.log("Ollama Models: llama3.2:1b, llama3.2:3b, llama3:latest");
+  console.log("  Interactive (default Groq 70B): node llm-client.js --interactive");
+  console.log("  Interactive (Ollama):           node llm-client.js --ollama --interactive [model]");
+  console.log("  Task (default Groq 70B):        node llm-client.js --task 'task description'");
+  console.log("\nGroq Models: llama-3.3-70b-versatile (default), llama-3.1-8b-instant, mixtral-8x7b-32768");
+  console.log("Ollama Models: llama3.2:3b, llama3.1:8b, llama3:latest");
   console.log("\nExamples:");
-  console.log("  node llm-client.js --groq --interactive");
-  console.log("  node llm-client.js --ollama --interactive llama3.2:1b");
-  console.log("  node llm-client.js --groq --task 'Navigate to github.com and take a screenshot'");
-  console.log("\nNote: Set GROQ_API_KEY environment variable for Groq");
+  console.log("  node llm-client.js --interactive                  # Uses Groq 70B (recommended)");
+  console.log("  node llm-client.js --ollama --interactive llama3.2:3b");
+  console.log("  node llm-client.js --task 'Navigate to github.com and take a screenshot'");
+  console.log("\nGroq API key sources (checked in order):");
+  console.log("  1) GROQ_API_KEY env var");
+  console.log("  2) groq.config.json (GROQ_API_KEY or groqApiKey)");
+  console.log("  3) config.json (GROQ_API_KEY or groqApiKey)");
   process.exit(1);
 }
 
-// Parse provider and model
+// Parse provider and model (can override defaults)
 for (let i = 0; i < args.length; i++) {
   if (args[i] === '--groq') {
     useGroq = true;
-    selectedModel = "llama-3.3-70b-versatile"; // default Groq model
+    if (!selectedModel || selectedModel.includes("llama3.2")) {
+      selectedModel = "llama-3.3-70b-versatile"; // Groq default
+    }
   } else if (args[i] === '--ollama') {
     useGroq = false;
-    selectedModel = "llama3.2:1b"; // default Ollama model
+    selectedModel = "llama3.2:3b"; // Better Ollama default (not 1B)
   } else if (args[i] === '--interactive' && args[i + 1] && !args[i + 1].startsWith('--')) {
     selectedModel = args[i + 1];
+    i++; // skip next arg
   }
 }
 
-// Validate Groq API key
+// Validate Groq API key if using Groq
 if (useGroq && !groqApiKey) {
-  console.error("❌ GROQ_API_KEY environment variable not set!");
-  console.error("   Set it with: $env:GROQ_API_KEY=\"your_api_key_here\"");
+  console.error("❌ GROQ_API_KEY not set.");
+  console.error("   Provide it via environment or groq.config.json/config.json (field GROQ_API_KEY or groqApiKey)");
   console.error("   Get one at: https://console.groq.com/keys");
   process.exit(1);
 }
 
 const mode = args.find(arg => arg === '--interactive' || arg === '--task');
 
-if (mode === "--interactive") {
+// If no mode specified but has interactive flag, default to interactive
+if (!mode && args.length > 0) {
+  const nonFlagArgs = args.filter(arg => !arg.startsWith('--'));
+  if (nonFlagArgs.length === 0) {
+    console.log("🎯 No mode specified, defaulting to --interactive");
+    args.push('--interactive');
+  }
+}
+
+if (mode === "--interactive" || args.includes('--interactive')) {
   interactiveMode().catch((error) => {
     console.error("Fatal error:", error);
     process.exit(1);
