@@ -65,6 +65,11 @@ User: "type 'hello world' in the message box"
 {"tool":"browser_fill_form","arguments":{"selector":"input[type='search']","value":"python tutorials"}}
 ```
 
+**Submit after filling (recommended for search):**
+```json
+{"tool":"browser_fill_form","arguments":{"selector":"Search","value":"python tutorials","submit":true}}
+```
+
 ---
 
 #### 4. **Page Snapshots** (`browser_get_snapshot`)
@@ -224,6 +229,22 @@ User: "scroll into view the contact form"
 **LLM Response:**
 ```json
 {"tool":"browser_scroll","arguments":{"selector":"#contact-form"}}
+```
+
+---
+
+#### 11. **Press Key** (`browser_press_key`)
+Press keyboard keys, optionally focusing an element first.
+
+**Usage:**
+```
+User: "press enter"
+User: "press tab"
+```
+
+**LLM Response:**
+```json
+{"tool":"browser_press_key","arguments":{"key":"Enter"}}
 ```
 
 ---

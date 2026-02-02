@@ -27,7 +27,7 @@ Get your free Groq API key at [console.groq.com/keys](https://console.groq.com/k
 
 ## 🛠️ Features
 
-- **10 Browser Automation Tools** via MCP protocol
+- **12 Browser Automation Tools** via MCP protocol
 - **Chrome Profile Management** - Use your real Chrome profile with logged-in sessions
 - **Natural Language Control** - Describe actions in plain English
 - **Dual LLM Support** - Groq Cloud API (70B models) or Local Ollama
@@ -88,7 +88,7 @@ node llm-client.js --ollama --interactive llama3.2:3b
 
 1. **browser_navigate** - Navigate to URLs
 2. **browser_click** - Click elements
-3. **browser_fill_form** - Fill input fields
+3. **browser_fill_form** - Fill input fields (optionally submit)
 4. **browser_get_snapshot** - Get interactive DOM elements
 5. **browser_screenshot** - Capture screenshots
 6. **browser_wait_for** - Wait for elements/timeouts
@@ -96,6 +96,8 @@ node llm-client.js --ollama --interactive llama3.2:3b
 8. **browser_save_auth** - Save authentication state
 9. **browser_list_profiles** - List available Chrome profiles
 10. **browser_select_profile** - Switch to a specific Chrome profile
+11. **browser_press_key** - Press keyboard keys (e.g., Enter)
+12. **browser_scroll** - Scroll the page or elements into view
 
 ## 📖 Command Examples
 

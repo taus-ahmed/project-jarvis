@@ -12,6 +12,11 @@ import readline from "readline";
 import fetch from "node-fetch";
 import { promises as fs } from "fs";
 import path from "path";
+import {
+  findSimilarSequences,
+  storeInteraction,
+  formatSequenceForLLM
+} from "./interaction-memory.js";
 
 let mcpClient = null;
 let availableTools = [];
@@ -143,6 +148,10 @@ GENERIC AUTOMATION STRATEGIES:
    - If current page has a search box, use it
    - Otherwise, navigate to a search engine and use its search box
 
+  When a search box is present, prefer:
+  - browser_fill_form with {"submit": true}
+  - or browser_press_key with key "Enter" after filling
+
 5. SNAPSHOT-AWARE DEBUGGING:
    When clicks or form fills fail due to selector errors:
    - IMMEDIATELY call browser_get_snapshot({"simplified":true})
@@ -160,14 +169,28 @@ GENERIC AUTOMATION STRATEGIES:
    - Always use full HTTPS URLs like "https://example.com"
    - Never use relative paths or placeholders
 
+7. EMAIL COMPOSITION (Gmail or webmail):
+  When the user asks to write/compose/email someone or provides a context to send:
+  - You MUST draft a concise subject and body based on the user's context.
+  - Then call tools to open compose UI and fill:
+    • To: recipient address
+    • Subject: generated subject
+    • Body: generated body
+  - Prefer selectors by visible labels: "To", "Subject", "Message Body".
+  - If selectors fail, call browser_get_snapshot and retry with correct selectors.
+  - NEVER click Send unless the user explicitly asks to send.
+
 TOOL EXAMPLES (use as patterns, not literal copies):
 - List profiles: {"tool":"browser_list_profiles","arguments":{}}
 - Select profile: {"tool":"browser_select_profile","arguments":{"directory":"Default"}}
 - Navigate: {"tool":"browser_navigate","arguments":{"url":"https://..."}}
 - Click: {"tool":"browser_click","arguments":{"selector":"Button Text or CSS"}}
 - Fill: {"tool":"browser_fill_form","arguments":{"selector":"input name or label","value":"text"}}
+- Fill+Submit: {"tool":"browser_fill_form","arguments":{"selector":"Search","value":"query","submit":true}}
+- Press key: {"tool":"browser_press_key","arguments":{"key":"Enter"}}
 - Snapshot: {"tool":"browser_get_snapshot","arguments":{"simplified":true}}
 - Screenshot: {"tool":"browser_screenshot","arguments":{}}
+- Scroll: {"tool":"browser_scroll","arguments":{"to":"bottom"}}
 
 REMEMBER: Output ONLY valid JSON. No explanations, no echoing instructions.`;
 
@@ -254,7 +277,26 @@ async function executeBrowserAction(userInput, conversationHistory) {
     ? `Current URL: ${lastUrl}. Current page title: ${lastTitle || "unknown"}.`
     : `Current URL: unknown (no navigation yet).`;
   
-  const userPromptWithContext = `${contextLine}\nUser request: ${userInput}`;
+  let userPromptWithContext = `${contextLine}\nUser request: ${userInput}`;
+
+  // Email compose hint
+  const emailIntent = /(gmail|email|mail|compose|write.*mail|send.*mail)/i.test(userInput) && /@/.test(userInput);
+  if (emailIntent) {
+    userPromptWithContext += `\n\nEmail drafting requirement: generate a concise subject and body from the user's context, then fill To/Subject/Message Body using tool calls. Do NOT send unless explicitly asked.`;
+  }
+
+  // Try interaction memory for similar sequences
+  if (lastUrl) {
+    try {
+      const matches = await findSimilarSequences(lastUrl, userInput, 0.6);
+      if (matches.length > 0) {
+        const topMatches = matches.slice(0, 2).map(formatSequenceForLLM).join("\n");
+        userPromptWithContext += `\n\nRelevant cached interactions:\n${topMatches}`;
+      }
+    } catch (error) {
+      console.error(`⚠️  Memory lookup failed: ${error.message}`);
+    }
+  }
 
   const llmResponse = await callLLM(userPromptWithContext);
   
@@ -317,10 +359,20 @@ async function executeBrowserAction(userInput, conversationHistory) {
 
     console.log("🔄 Executing tool calls...\n");
     let results = [];
+    const steps = [];
+    let allSuccess = true;
 
     for (const call of toolCalls) {
       const result = await callBrowserTool(call.tool, call.arguments);
       results.push(result);
+      const stepSuccess = !!(result && result.success);
+      allSuccess = allSuccess && stepSuccess;
+      steps.push({
+        action: call.tool,
+        arguments: call.arguments || {},
+        timestamp: Date.now(),
+        success: stepSuccess
+      });
       
       // Store profile list in context for future decisions
       if (call.tool === "browser_list_profiles" && result && result.success && result.profiles) {
@@ -363,6 +415,14 @@ async function executeBrowserAction(userInput, conversationHistory) {
       role: "assistant",
       content: `Executed: ${toolCalls.map((c) => c.tool).join(", ")}`,
     });
+
+    if (lastUrl && steps.length > 0) {
+      try {
+        await storeInteraction(lastUrl, userInput, steps, allSuccess);
+      } catch (error) {
+        console.error(`⚠️  Memory store failed: ${error.message}`);
+      }
+    }
   } catch (e) {
     console.log(`⚠️  Failed to parse JSON: ${e.message}`);
     console.log(`📝 Response preview: ${cleanedResponse.substring(0, 100)}...\n`);

@@ -34,6 +34,15 @@ const CHROME_USER_DATA_PATHS: Record<string, string> = {
 let browserContext: BrowserContext | null = null;
 let currentPage: Page | null = null;
 
+// Utility: escape values for RegExp and CSS attribute selectors
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function escapeCssAttributeValue(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/"/g, "\\\"");
+}
+
 // Chrome profile interface
 interface ChromeProfile {
   name: string;
@@ -339,6 +348,16 @@ async function resolveSelector(selector: string): Promise<string> {
     // Continue
   }
 
+  // Try as placeholder
+  try {
+    const byPlaceholder = page.getByPlaceholder(selector, { exact: false });
+    if (await byPlaceholder.count() > 0) {
+      return `placeholder=${selector}`;
+    }
+  } catch (error) {
+    // Continue
+  }
+
   // Try as role
   try {
     const byRole = page.getByRole(selector as any);
@@ -350,6 +369,86 @@ async function resolveSelector(selector: string): Promise<string> {
   }
 
   throw new Error(`Could not resolve selector: ${selector}`);
+}
+
+/**
+ * Smart fill logic for inputs/search boxes using heuristics.
+ * Avoids hard-coding sites; prefers semantic attributes.
+ */
+async function smartFillForm(
+  page: Page,
+  selector: string,
+  value: string,
+  timeout: number
+): Promise<{ resolvedSelector: string; strategy: string } | null> {
+  const normalized = selector.trim();
+  const escapedSelector = escapeCssAttributeValue(normalized);
+  const selectorRegex = new RegExp(escapeRegExp(normalized), "i");
+  const searchHint = /(search|find|lookup|query)/i.test(normalized);
+
+  const candidates: Array<{ label: string; locator: any }> = [];
+
+  // Semantic locators
+  candidates.push({
+    label: `label:${normalized}`,
+    locator: page.getByLabel(normalized, { exact: false })
+  });
+  candidates.push({
+    label: `placeholder:${normalized}`,
+    locator: page.getByPlaceholder(normalized, { exact: false })
+  });
+  candidates.push({
+    label: `role:textbox:${normalized}`,
+    locator: page.getByRole("textbox", { name: selectorRegex })
+  });
+  candidates.push({
+    label: `role:combobox:${normalized}`,
+    locator: page.getByRole("combobox", { name: selectorRegex })
+  });
+
+  if (searchHint) {
+    candidates.push({ label: "role:searchbox", locator: page.getByRole("searchbox") });
+  }
+
+  // Attribute-based selectors (case-insensitive)
+  const attrSelectors = [
+    `input[placeholder*="${escapedSelector}" i]`,
+    `textarea[placeholder*="${escapedSelector}" i]`,
+    `input[aria-label*="${escapedSelector}" i]`,
+    `textarea[aria-label*="${escapedSelector}" i]`,
+    `input[name*="${escapedSelector}" i]`,
+    `input[id*="${escapedSelector}" i]`,
+    `[contenteditable="true"][aria-label*="${escapedSelector}" i]`,
+    `[contenteditable="true"][placeholder*="${escapedSelector}" i]`
+  ];
+
+  for (const css of attrSelectors) {
+    candidates.push({ label: css, locator: page.locator(css) });
+  }
+
+  if (searchHint) {
+    candidates.push({ label: "input[type=search]", locator: page.locator("input[type=search]") });
+    candidates.push({ label: "form[role=search] input", locator: page.locator("form[role=search] input") });
+    candidates.push({ label: "[aria-label*=search i]", locator: page.locator("input[aria-label*='search' i], textarea[aria-label*='search' i]") });
+    candidates.push({ label: "[placeholder*=search i]", locator: page.locator("input[placeholder*='search' i], textarea[placeholder*='search' i]") });
+  }
+
+  // Final generic fallback: first visible input
+  candidates.push({ label: "input/textarea/contenteditable", locator: page.locator("input, textarea, [contenteditable='true']") });
+
+  for (const candidate of candidates) {
+    try {
+      if (await candidate.locator.count() === 0) continue;
+      const element = candidate.locator.first();
+      await element.waitFor({ state: "visible", timeout: Math.min(timeout, 5000) });
+      await element.fill(value, { timeout });
+      return { resolvedSelector: candidate.label, strategy: "smart_fill" };
+    } catch (error) {
+      // Try next candidate
+    }
+  }
+
+  return null;
 }
 
 // Simple argument helper
@@ -396,7 +495,8 @@ const tools: Tool[] = [
       properties: {
         selector: { type: "string", description: "CSS selector, label text, or placeholder" },
         value: { type: "string", description: "Value to fill" },
-        timeout: { type: "number", description: "Timeout ms", default: 30000 }
+        timeout: { type: "number", description: "Timeout ms", default: 30000 },
+        submit: { type: "boolean", description: "Press Enter after filling", default: false }
       },
       required: ["selector", "value"]
     }
@@ -452,6 +552,33 @@ const tools: Tool[] = [
         state: { type: "string", enum: ["attached", "detached", "visible", "hidden"], default: "visible" }
       },
       required: ["selector"]
+    }
+  },
+  {
+    name: "browser_press_key",
+    description: "Press a keyboard key. Optionally focus an element first.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        key: { type: "string", description: "Key to press (e.g., Enter, Tab, ArrowDown)" },
+        selector: { type: "string", description: "Optional selector to focus before pressing" },
+        delay: { type: "number", description: "Delay between keydown and keyup (ms)", default: 0 }
+      },
+      required: ["key"]
+    }
+  },
+  {
+    name: "browser_scroll",
+    description: "Scroll the page or an element into view.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        selector: { type: "string", description: "Optional selector to scroll into view" },
+        x: { type: "number", description: "Horizontal scroll delta (px)" },
+        y: { type: "number", description: "Vertical scroll delta (px)" },
+        to: { type: "string", enum: ["top", "bottom"], description: "Scroll to top or bottom" },
+        behavior: { type: "string", enum: ["auto", "smooth"], default: "auto" }
+      }
     }
   },
   {
@@ -541,8 +668,37 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const page = currentPage!;
         const selector = getArg<string>(args, "selector", "");
         const timeout = getArg<number>(args, "timeout", 30000);
-        const resolvedSelector = await resolveSelector(selector);
-        await page.locator(resolvedSelector).first().click({ timeout });
+        let resolvedSelector = "";
+
+        // Prefer role-based button matching to avoid false positives (e.g., "Send feedback")
+        try {
+          const exactName = new RegExp(`^\\s*${escapeRegExp(selector)}\\s*$`, "i");
+          const buttonByNameExact = page.getByRole("button", { name: exactName });
+          if (await buttonByNameExact.count() > 0) {
+            await buttonByNameExact.first().click({ timeout });
+            resolvedSelector = `role:button:${selector}`;
+          }
+        } catch (error) {
+          // Continue to fallback strategies
+        }
+
+        if (!resolvedSelector) {
+          try {
+            const nameContains = new RegExp(`\\b${escapeRegExp(selector)}\\b`, "i");
+            const buttonByNameContains = page.getByRole("button", { name: nameContains });
+            if (await buttonByNameContains.count() > 0) {
+              await buttonByNameContains.first().click({ timeout });
+              resolvedSelector = `role:button:${selector}`;
+            }
+          } catch (error) {
+            // Continue to fallback strategies
+          }
+        }
+
+        if (!resolvedSelector) {
+          resolvedSelector = await resolveSelector(selector);
+          await page.locator(resolvedSelector).first().click({ timeout });
+        }
         
         // Wait a bit for any navigation or dynamic content
         await page.waitForTimeout(1000);
@@ -567,8 +723,29 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const selector = getArg<string>(args, "selector", "");
         const value = getArg<string>(args, "value", "");
         const timeout = getArg<number>(args, "timeout", 30000);
-        const resolvedSelector = await resolveSelector(selector);
-        await page.locator(resolvedSelector).first().fill(value, { timeout });
+        const submit = getArg<boolean>(args, "submit", false);
+
+        let resolvedSelector = "";
+        let strategy = "resolve_selector";
+
+        try {
+          resolvedSelector = await resolveSelector(selector);
+          const locator = page.locator(resolvedSelector).first();
+          await locator.fill(value, { timeout });
+          if (submit) {
+            await locator.press("Enter", { timeout });
+          }
+        } catch (error) {
+          const smartResult = await smartFillForm(page, selector, value, timeout);
+          if (!smartResult) {
+            throw error;
+          }
+          resolvedSelector = smartResult.resolvedSelector;
+          strategy = smartResult.strategy;
+          if (submit) {
+            await page.keyboard.press("Enter");
+          }
+        }
         
         return {
           content: [
@@ -578,6 +755,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 success: true,
                 filled: selector,
                 resolvedSelector,
+                strategy,
+                submitted: submit,
                 value: value.substring(0, 50) + (value.length > 50 ? "..." : "")
               })
             }
@@ -686,6 +865,87 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 selector,
                 state,
                 message: `Element reached ${state} state`
+              })
+            }
+          ]
+        };
+      }
+
+      case "browser_press_key": {
+        const page = currentPage!;
+        const key = getArg<string>(args, "key", "Enter");
+        const selector = getArg<string>(args, "selector");
+        const delay = getArg<number>(args, "delay", 0);
+
+        if (selector) {
+          const resolvedSelector = await resolveSelector(selector);
+          await page.locator(resolvedSelector).first().focus();
+        }
+
+        await page.keyboard.press(key, { delay });
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                success: true,
+                key,
+                focusedSelector: selector || null
+              })
+            }
+          ]
+        };
+      }
+
+      case "browser_scroll": {
+        const page = currentPage!;
+        const selector = getArg<string>(args, "selector");
+        const x = getArg<number>(args, "x");
+        const y = getArg<number>(args, "y");
+        const to = getArg<string>(args, "to");
+        const behavior = getArg<string>(args, "behavior", "auto");
+
+        if (selector) {
+          const resolvedSelector = await resolveSelector(selector);
+          await page.locator(resolvedSelector).first().scrollIntoViewIfNeeded();
+        } else if (to) {
+          await page.evaluate(
+            `(() => {
+              const position = ${JSON.stringify(to)};
+              const behavior = ${JSON.stringify(behavior)};
+              const top = position === "top" ? 0 : document.body.scrollHeight;
+              window.scrollTo({ top, behavior });
+            })()` as any
+          );
+        } else if (typeof x === "number" || typeof y === "number") {
+          await page.evaluate(
+            `(() => {
+              const x = ${JSON.stringify(x ?? 0)};
+              const y = ${JSON.stringify(y ?? 0)};
+              const behavior = ${JSON.stringify(behavior)};
+              window.scrollBy({ left: x || 0, top: y || 0, behavior });
+            })()` as any
+          );
+        } else {
+          await page.evaluate(
+            `(() => {
+              window.scrollBy({ top: window.innerHeight, left: 0, behavior: "auto" });
+            })()` as any
+          );
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                success: true,
+                selector: selector || null,
+                x: typeof x === "number" ? x : null,
+                y: typeof y === "number" ? y : null,
+                to: to || null,
+                behavior
               })
             }
           ]
