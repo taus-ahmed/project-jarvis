@@ -15,7 +15,7 @@ import re
 import string 
 
 # --- CONFIGURATION ---
-GENAI_KEY = "AIzaSyDoH8xVNYHHV3_sAfxm-qtdQLqy7FHGEpU"  # <--- PASTE YOUR API KEY HERE
+GENAI_KEY = "XYZ"  # <--- PASTE YOUR API KEY HERE
 CHROME_PROFILE = "Default"
 
 # --- SMART DRIVE DETECTION ---
