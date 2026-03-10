@@ -1,7 +1,7 @@
 import os
 
 # --- API KEYS ---
-GENAI_KEY = "AIzaSyDoH8xVNYHHV3_sAfxm-qtdQLqy7FHGEpU" 
+GENAI_KEY = "XYZ" 
 
 # --- DYNAMIC PATHS (No more hardcoding) ---
 # We use environment variables to find the user's specific paths
